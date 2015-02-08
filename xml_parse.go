@@ -12,7 +12,7 @@ import (
 	"os/exec"
 	//"time"
 	"bytes"
-	"strings"
+	//	"strings"
 	"sync"
 )
 
@@ -33,10 +33,10 @@ type DocumentParser struct {
 	Cmd            *exec.Cmd
 	Stdout         io.ReadCloser
 	Stderr         io.ReadCloser
-	lemmatizer     *Lemmatizer
+	bodyReader     *ReadersQueue
 	lastError      string
 	documentOffset int64
-	locker         sync.Locker
+	sync.Mutex
 }
 
 // dropCR drops a terminal \r from the data.
@@ -73,6 +73,7 @@ func (this *DocumentParser) ParseStderr() {
 	for {
 		for scanner.Scan() {
 			this.lastError = scanner.Text()
+			//log.Printf("lasterr %v\n", this.lastError)
 			if err := scanner.Err(); err != nil {
 				log.Printf("reading standard input:", err)
 			}
@@ -84,21 +85,29 @@ func (this *DocumentParser) ParseStderr() {
 		}
 
 	}
-	log.Printf("scanner: %v\n", scanner.Err())
-	log.Printf("lasterr: %v\n", this.lastError)
-	log.Println("closed tomita stderr")
 	return
 }
 
 func (this *DocumentParser) StartTomita() (err error) {
+	//this.locker.Lock()
+	//defer this.locker.Unlock()
+
+	if this.Cmd != nil && this.Cmd.Process != nil {
+		this.Cmd.Process.Kill()
+	}
+
 	this.lastError = ""
 	this.documentOffset = 0
+	this.Cmd = nil
+	this.bodyReader = NewReadersQueue()
+	this.Stderr = nil
+	this.Stdout = nil
 
 	os.Chdir("parser")
 	defer os.Chdir("..")
 	//this.Cmd = exec.Command("tomitaparser.exe", "config.proto")
-	this.Cmd = exec.Command("tomita.bat", "config.proto")
-	this.Cmd.Stdin = this.lemmatizer
+	this.Cmd = exec.Command("parser.bat", "config.proto")
+	this.Cmd.Stdin = this.bodyReader
 	this.Stdout, err = this.Cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -117,12 +126,11 @@ func (this *DocumentParser) StartTomita() (err error) {
 }
 
 func CreateDocumentParser() (this *DocumentParser, err error) {
-	var wl sync.RWMutex
+	this = &DocumentParser{}
 
-	this = &DocumentParser{
-		locker:     wl.RLocker(),
-		lemmatizer: CreateLemmatizer(),
-	}
+	this.Lock()
+	defer this.Unlock()
+
 	err = this.StartTomita()
 
 	// this.Stdin.Write([]byte("АСЕПТОЛИН 90% Р-Р Д/НАРУЖ ПРИМЕНЕНИЯ 100МЛ ФЛАК - ФАРМАЦЕВТИЧЕСКИЙ КОМБИНАТ\n"))
@@ -138,7 +146,7 @@ func CreateDocumentParser() (this *DocumentParser, err error) {
 	return this, err
 }
 
-func (doc *Document) PrintDocument(documentOffset int64) []byte {
+func (doc *Document) PrintDocument() []byte {
 
 	type Drug struct {
 		Line          int64  `xml:"Line,attr"`
@@ -153,7 +161,7 @@ func (doc *Document) PrintDocument(documentOffset int64) []byte {
 	// if err != nil {
 	// 	log.Panicf("Error while reading lead for drug, %v\n", err)
 	// }
-	drug.Line = doc.DocumentIndex - documentOffset
+	drug.Line = doc.DocumentIndex
 	drug.Name = &doc.Name
 	drug.Dosage = &doc.Dosage
 	drug.Form = &doc.Form
@@ -166,13 +174,23 @@ func (doc *Document) PrintDocument(documentOffset int64) []byte {
 	return b
 }
 
-func (this *DocumentParser) ParseFacts(input io.Reader, writer io.Writer) (err error) {
-	this.locker.Lock()
-	defer this.locker.Unlock()
+func (this *DocumentParser) ParseFacts(input io.Reader,
+	writer io.Writer,
+	maxFileSize int64) (err error) {
+	this.Lock()
+	defer this.Unlock()
 
-	writer.Write([]byte("<?xml version='1.0' encoding='utf-8'?>\n<Drugs>\n"))
+	log.Printf("Enter into ParseFacts")
 
-	this.lemmatizer.SetInput(input)
+	//must restart Tomita after at the end
+	defer func() {
+		func() {
+			this.StartTomita()
+		}()
+	}()
+
+	this.bodyReader.AppendReader(
+		io.LimitReader(input, maxFileSize))
 
 	//scanner2 := bufio.NewScanner(this.Stdout)
 	//for scanner2.Scan() {
@@ -185,9 +203,11 @@ func (this *DocumentParser) ParseFacts(input io.Reader, writer io.Writer) (err e
 	//log.Println("finished tomita read")
 	//return nil
 
-	documentOffset := this.documentOffset
+	var docsBuffer bytes.Buffer
+
+	docsBuffer.Write([]byte("<?xml version='1.0' encoding='utf-8'?>\n<Drugs>\n"))
+
 	decoder := xml.NewDecoder(this.Stdout)
-xmlReadLoop:
 	for {
 		t, err := decoder.Token()
 		if t == nil {
@@ -195,15 +215,23 @@ xmlReadLoop:
 				log.Println("token nil")
 				continue
 			}
-			if err == io.EOF ||
-				strings.Contains(err.Error(), "</fdo_objects>") {
+			if err == io.EOF {
+				//log.Printf("Tomita stopped ex :%v\n", this.Cmd.Wait())
+				//log.Printf("Tomita stopped :%v\n", this.lastError)
+				if n, _ := input.Read([]byte{0}); n == 1 {
+					docsBuffer.Write([]byte("<Error>Parsing is interrupted</Error>"))
+				}
+				break
+			} else {
 				//That is not good
 				log.Printf("Tomita stopped :%v\n", this.lastError)
-				xml.EscapeText(writer, []byte(this.lastError))
-				log.Println("token eof")
-				break
+				docsBuffer.Write([]byte("<Error>"))
+				xml.EscapeText(
+					&docsBuffer,
+					[]byte(this.lastError))
+				docsBuffer.Write([]byte("</Error>"))
 			}
-			log.Fatal(err)
+			//log.Fatal(err)
 		}
 
 		// Inspect the type of the token just read.
@@ -214,20 +242,17 @@ xmlReadLoop:
 				// decode a whole chunk of following XML into the
 				decoder.DecodeElement(&d, &se)
 
-				if len(d.EOF) > 0 {
-					this.documentOffset = d.DocumentIndex
-					log.Println("stop!!!")
-					break xmlReadLoop
-				}
-
-				writer.Write(d.PrintDocument(documentOffset))
-				writer.Write([]byte("\n"))
+				docsBuffer.Write(d.PrintDocument())
+				docsBuffer.Write([]byte("\n"))
 				//log.Printf("print doc: %v\n", d.Name.Value)
 			}
 		}
 	}
 
-	writer.Write([]byte("</Drugs>"))
+	docsBuffer.Write([]byte("</Drugs>"))
+
+	//finally write to output
+	docsBuffer.WriteTo(writer)
 
 	log.Println("stop2!!!")
 	return nil
